@@ -25,7 +25,7 @@ app.post('/api/run/:method', async (req, res) => {
   
   try {
     // =====================================
-    // 1. ระบบ Authentication
+    // 1. Authentication
     // =====================================
     if (method === 'login') {
       const [username, password] = args;
@@ -44,30 +44,42 @@ app.post('/api/run/:method', async (req, res) => {
     }
 
     // =====================================
-    // 2. Dashboard และบันทึกสุขภาพ
+    // 2. Dashboard & Record
     // =====================================
     else if (method === 'getDashboardData') {
       const [role, userId] = args;
       const isAdmin = role === 'admin';
+      
       const patRes = isAdmin ? await pool.query('SELECT * FROM patients') : await pool.query('SELECT * FROM patients WHERE current_osm = $1', [userId]);
       const recRes = isAdmin ? await pool.query('SELECT * FROM records ORDER BY record_date DESC') : await pool.query('SELECT * FROM records WHERE user_id = $1 ORDER BY record_date DESC', [userId]);
+      
       const highRisk = recRes.rows.filter(r => r.fbs > 126 || r.bp_sys > 140).length;
       const mapData = patRes.rows.filter(p => p.lat && p.lng).map(p => ({ pid: p.id, name: p.name, lat: p.lat, lng: p.lng, disease: p.disease }));
       const tickets = recRes.rows.filter(r => r.wellness === 'ต้องเฝ้าระวัง').slice(0, 10).map(r => ({ date: r.record_date, pid: r.patient_id, fbs: r.fbs, sys: r.bp_sys }));
+      
       let leaderboard = [];
       if (isAdmin) {
          const lbRes = await pool.query("SELECT u.name, u.zone, COUNT(r.id) as count FROM users u LEFT JOIN records r ON u.id = r.user_id WHERE u.role = 'osm' GROUP BY u.id, u.name, u.zone ORDER BY count DESC LIMIT 5");
          leaderboard = lbRes.rows;
       }
-      res.json({ status: 'success', data: { 
-        totalPatients: patRes.rowCount, highRisk, recordsThisMonth: recRes.rowCount, 
-        chartData: { 
+      
+      res.json({ 
+        status: 'success', 
+        data: { 
+          totalPatients: patRes.rowCount, 
+          highRisk, 
+          recordsThisMonth: recRes.rowCount, 
+          chartData: { 
             labels: recRes.rows.slice(0,10).reverse().map(r => new Date(r.record_date).getDate() + '/' + (new Date(r.record_date).getMonth()+1)), 
-            fbs: recRes.rows.slice(0,10).reverse().map(r=>r.fbs), sys: recRes.rows.slice(0,10).reverse().map(r=>r.bp_sys) 
-        }, 
-        patientList: patRes.rows.map(p => ({ pid: p.id, name: p.name, disease: p.disease, current_osm: p.current_osm })), 
-        mapData, tickets, leaderboard 
-      }});
+            fbs: recRes.rows.slice(0,10).reverse().map(r=>r.fbs), 
+            sys: recRes.rows.slice(0,10).reverse().map(r=>r.bp_sys) 
+          }, 
+          patientList: patRes.rows.map(p => ({ pid: p.id, name: p.name, disease: p.disease })), 
+          mapData, 
+          tickets, 
+          leaderboard 
+        }
+      });
     }
     else if (method === 'saveNCDRecord') {
       const [formData] = args;
@@ -76,15 +88,20 @@ app.post('/api/run/:method', async (req, res) => {
       const height = parseFloat(formData.height) || 0;
       const bmi = height > 0 ? (weight / Math.pow(height/100, 2)).toFixed(2) : 0;
       let bmiText = bmi < 18.5 ? "ผอม" : bmi < 25 ? "ท้วม" : bmi < 30 ? "อ้วน" : "อ้วนมาก";
-      await pool.query(`INSERT INTO records (id, patient_id, weight, height, bmi, bmi_text, waist, fbs, bp_sys, bp_dia, ls_score, wellness, advice, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-        [rid, formData.pid, weight, height, bmi, bmiText, formData.waist || null, formData.fbs || null, formData.bp_sys || null, formData.bp_dia || null, formData.ls_score || null, formData.wellness, formData.advice, formData.userId]
+      
+      await pool.query(`INSERT INTO records (id, patient_id, weight, height, bmi, bmi_text, fbs, bp_sys, bp_dia, ls_score, wellness, advice, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`, 
+        [rid, formData.pid, weight, height, bmi, bmiText, formData.fbs || null, formData.bp_sys || null, formData.bp_dia || null, formData.ls_score || null, formData.wellness, formData.advice, formData.userId]
       );
-      if(formData.lat && formData.lng) await pool.query('UPDATE patients SET lat=$1, lng=$2 WHERE id=$3', [formData.lat, formData.lng, formData.pid]);
-      res.json({ status: 'success', bmi, bmiText });
+      
+      if(formData.lat && formData.lng) {
+        await pool.query('UPDATE patients SET lat=$1, lng=$2 WHERE id=$3', [formData.lat, formData.lng, formData.pid]);
+      }
+      
+      res.json({ status: 'success', bmi, bmiText, message: 'บันทึกการเยี่ยมบ้านสำเร็จ' });
     }
 
     // =====================================
-    // 3. จัดการเป้าหมาย และการมอบหมาย อสม.
+    // 3. Assign & Targets
     // =====================================
     else if (method === 'getAdminAssignData') {
       const osmRes = await pool.query("SELECT id, name FROM users WHERE role='osm'");
@@ -96,25 +113,25 @@ app.post('/api/run/:method', async (req, res) => {
       const [action, pData] = args;
       if (action === 'add') {
         const { rows } = await pool.query('SELECT id FROM patients WHERE id=$1', [pData.pid]);
-        if (rows.length > 0) return res.json({ status: 'error', message: 'รหัสผู้ป่วยนี้มีอยู่แล้ว' });
+        if (rows.length > 0) return res.json({ status: 'error', message: 'รหัสผู้ป่วยนี้มีอยู่แล้วในระบบ' });
         await pool.query('INSERT INTO patients (id, name, disease) VALUES ($1, $2, $3)', [pData.pid, pData.name, pData.disease]);
       } else if (action === 'edit') {
         await pool.query('UPDATE patients SET id=$1, name=$2, disease=$3 WHERE id=$4', [pData.pid, pData.name, pData.disease, pData.targetId]);
       } else if (action === 'delete') {
         await pool.query('DELETE FROM patients WHERE id=$1', [pData.targetId]);
       }
-      res.json({ status: 'success', message: 'จัดการข้อมูลผู้ป่วยสำเร็จ' });
+      res.json({ status: 'success', message: 'จัดการข้อมูลเป้าหมายสำเร็จ' });
     }
     else if (method === 'saveAssignments') {
       const [osmId, patientIds] = args;
       for (let pid of patientIds) {
         await pool.query('UPDATE patients SET current_osm=$1 WHERE id=$2', [osmId, pid]);
       }
-      res.json({ status: 'success', count: patientIds.length });
+      res.json({ status: 'success', count: patientIds.length, message: `มอบหมายเป้าหมายให้ อสม. สำเร็จ ${patientIds.length} รายการ` });
     }
 
     // =====================================
-    // 4. จัดการโรคประจำตัว
+    // 4. CRUD Master Data
     // =====================================
     else if (method === 'getDiseaseMasterData') { 
       const { rows } = await pool.query('SELECT * FROM diseases'); 
@@ -123,19 +140,14 @@ app.post('/api/run/:method', async (req, res) => {
     else if (method === 'manageDiseaseMaster') {
       const [action, payload] = args;
       if (action === 'add') {
-        const newId = "DS" + new Date().getTime().toString().slice(-4);
-        await pool.query('INSERT INTO diseases (id, name) VALUES ($1, $2)', [newId, payload.name]);
+        await pool.query('INSERT INTO diseases (id, name) VALUES ($1, $2)', ["DS" + new Date().getTime().toString().slice(-4), payload.name]);
       } else if (action === 'edit') {
         await pool.query('UPDATE diseases SET name=$1 WHERE id=$2', [payload.name, payload.id]);
       } else if (action === 'delete') {
         await pool.query('DELETE FROM diseases WHERE id=$1', [payload.id]);
       }
-      res.json({ status: 'success', message: 'จัดการข้อมูลโรคสำเร็จ' });
+      res.json({ status: 'success', message: 'จัดการโรคประจำตัวสำเร็จ' });
     }
-
-    // =====================================
-    // 5. จัดการหน่วยงาน
-    // =====================================
     else if (method === 'getHealthCenters') { 
       const { rows } = await pool.query('SELECT * FROM health_centers'); 
       res.json(rows); 
@@ -143,8 +155,7 @@ app.post('/api/run/:method', async (req, res) => {
     else if (method === 'manageHealthCenter') {
       const [action, payload] = args;
       if (action === 'add') {
-        const newId = "HC" + new Date().getTime().toString().slice(-4);
-        await pool.query('INSERT INTO health_centers (id, name, affiliation, address, tel, lat, lng) VALUES ($1, $2, $3, $4, $5, $6, $7)', [newId, payload.name, payload.affiliation, payload.address, payload.tel, payload.lat, payload.lng]);
+        await pool.query('INSERT INTO health_centers (id, name, affiliation, address, tel, lat, lng) VALUES ($1, $2, $3, $4, $5, $6, $7)', ["HC" + new Date().getTime().toString().slice(-4), payload.name, payload.affiliation, payload.address, payload.tel, payload.lat, payload.lng]);
       } else if (action === 'edit') {
         await pool.query('UPDATE health_centers SET name=$1, affiliation=$2, address=$3, tel=$4, lat=$5, lng=$6 WHERE id=$7', [payload.name, payload.affiliation, payload.address, payload.tel, payload.lat, payload.lng, payload.id]);
       } else if (action === 'delete') {
@@ -152,10 +163,6 @@ app.post('/api/run/:method', async (req, res) => {
       }
       res.json({ status: 'success', message: 'จัดการหน่วยงานสำเร็จ' });
     }
-
-    // =====================================
-    // 6. จัดการผู้ใช้งานระบบ
-    // =====================================
     else if (method === 'getUsersData') { 
       const { rows } = await pool.query('SELECT id, username, name, role, zone FROM users'); 
       res.json(rows); 
@@ -163,8 +170,9 @@ app.post('/api/run/:method', async (req, res) => {
     else if (method === 'manageUser') {
       const [action, u] = args;
       if (action === 'add') {
-        const newId = "U" + new Date().getTime().toString().slice(-4);
-        await pool.query('INSERT INTO users (id, username, password_hash, name, role, zone) VALUES ($1, $2, $3, $4, $5, $6)', [newId, u.username, hashPassword('1234'), u.name, u.role, u.zone]);
+        const { rows } = await pool.query('SELECT username FROM users WHERE username=$1', [u.username]);
+        if (rows.length > 0) return res.json({ status: 'error', message: 'Username นี้ถูกใช้งานแล้ว' });
+        await pool.query('INSERT INTO users (id, username, password_hash, name, role, zone) VALUES ($1, $2, $3, $4, $5, $6)', ["U" + new Date().getTime().toString().slice(-4), u.username, hashPassword('1234'), u.name, u.role, u.zone]);
       } else if (action === 'edit') {
         await pool.query('UPDATE users SET username=$1, name=$2, role=$3, zone=$4 WHERE id=$5', [u.username, u.name, u.role, u.zone, u.id]);
       } else if (action === 'reset') {
@@ -176,32 +184,45 @@ app.post('/api/run/:method', async (req, res) => {
     }
 
     // =====================================
-    // 7. นำเข้าข้อมูลด้วย CSV
+    // 5. CSV Import Generic
     // =====================================
     else if (method === 'importCSVGeneric') {
       const [type, dataArray] = args;
       let count = 0;
+      
       for (let row of dataArray.slice(1)) {
-        if (!row[0]) continue;
-        if (type === 'diseases') {
-          const newId = "DS" + new Date().getTime().toString().slice(-4) + count;
-          await pool.query('INSERT INTO diseases (id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING', [newId, row[0]]);
-        } else if (type === 'health_centers') {
-          const newId = "HC" + new Date().getTime().toString().slice(-4) + count;
-          await pool.query('INSERT INTO health_centers (id, name, affiliation, address, tel, lat, lng) VALUES ($1, $2, $3, $4, $5, $6, $7)', [newId, row[0], row[1], row[2], row[3], row[4], row[5]]);
-        } else if (type === 'users') {
-          const newId = "U" + new Date().getTime().toString().slice(-4) + count;
-          await pool.query('INSERT INTO users (id, username, password_hash, name, role, zone) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (username) DO NOTHING', [newId, row[0], hashPassword('1234'), row[1], row[2] || 'osm', row[3]]);
-        } else if (type === 'patients') {
-          await pool.query('INSERT INTO patients (id, name, disease) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET name=$2, disease=$3', [row[0], row[1], row[2]]);
+        if (!row[0] || String(row[0]).trim() === '') continue;
+        
+        try {
+          if (type === 'diseases') {
+            let r = await pool.query('INSERT INTO diseases (id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING', ["DS" + Math.floor(Math.random() * 10000), row[0].trim()]);
+            if(r.rowCount > 0) count++;
+            
+          } else if (type === 'health_centers') {
+            let r = await pool.query('INSERT INTO health_centers (id, name, affiliation, address, tel, lat, lng) VALUES ($1, $2, $3, $4, $5, $6, $7)', ["HC" + Math.floor(Math.random() * 10000), row[0].trim(), row[1], row[2], row[3], row[4], row[5]]);
+            if(r.rowCount > 0) count++;
+            
+          } else if (type === 'users') {
+            let rText = String(row[2] || 'osm').trim().toLowerCase();
+            if(rText === 'อสม' || rText === 'อสม.') rText = 'osm';
+            if(rText === 'แอดมิน' || rText === 'admin') rText = 'admin';
+            
+            let r = await pool.query('INSERT INTO users (id, username, password_hash, name, role, zone) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (username) DO NOTHING', ["U" + Math.floor(Math.random() * 10000), row[0].trim(), hashPassword('1234'), row[1].trim(), rText, row[3]]);
+            if(r.rowCount > 0) count++;
+            
+          } else if (type === 'patients') {
+            let r = await pool.query('INSERT INTO patients (id, name, disease) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET name=$2, disease=$3', [row[0].trim(), row[1].trim(), row[2]?row[2].trim():'']);
+            if(r.rowCount > 0) count++;
+          }
+        } catch(e) { 
+          console.error('CSV Row Error:', e.message); 
         }
-        count++;
       }
-      res.json({ status: 'success', count });
+      res.json({ status: 'success', count, message: `นำเข้าสำเร็จ ${count} รายการ (ข้ามรายการที่ซ้ำ)` });
     }
 
     // =====================================
-    // 8. การตั้งค่าระบบ
+    // 6. Config System
     // =====================================
     else if (method === 'getSystemConfig') { 
       const { rows } = await pool.query('SELECT * FROM config'); 
@@ -217,11 +238,11 @@ app.post('/api/run/:method', async (req, res) => {
           [key, configs[key]]
         );
       }
-      res.json({status: 'success'});
+      res.json({status: 'success', message: 'บันทึกการตั้งค่าสำเร็จ'});
     }
-
-    // หากเรียกผิด Method
-    else { res.json({ status: 'error', message: 'Method Not Found' }); }
+    else { 
+      res.json({ status: 'error', message: 'Method Not Found' }); 
+    }
 
   } catch (err) {
     console.error(err);
@@ -230,5 +251,4 @@ app.post('/api/run/:method', async (req, res) => {
 });
 
 app.get('*', (req, res) => { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(process.env.PORT || 3000, () => console.log(`🚀 Server running`));
